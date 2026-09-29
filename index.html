@@ -349,6 +349,13 @@ async function fromSleeper() {
   const cur = Math.max(1, Number(nfl.display_week || nfl.week) || 1);
   const upto = Math.min(cur, L.regWeeks);
   const weeks = [];
+  // A week is final once every NFL game that week is over (including Monday night), per ESPN's scoreboard.
+  let curDone = false;
+  try {
+    const sb = await getJSON(`https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard?dates=${nfl.season || L.season}&seasontype=2&week=${cur}`);
+    const ev = sb && Array.isArray(sb.events) ? sb.events : [];
+    curDone = ev.length > 0 && ev.every(e => { const t = e && e.status && e.status.type; return !!t && (t.completed === true || t.state === "post"); });
+  } catch {}
   let projStats = null;
   try {
     const q = ["QB","RB","WR","TE","K","DEF"].map(p => `position[]=${p}`).join("&");
@@ -376,7 +383,7 @@ async function fromSleeper() {
     const started = games.some(g => g.as > 0 || g.bs > 0);
     const lineups = {};
     m.forEach(x => { const u = rmap[x.roster_id]; if (u && x.starters && x.players_points) lineups[u] = { s: x.starters.map(id => id === "0" ? null : id), p: x.players_points }; });
-    const status = w < cur ? "final" : started ? "live" : "upcoming";
+    const status = w < cur || (w === cur && curDone) ? "final" : started ? "live" : "upcoming";
     let proj = null;
     if (status !== "final" && projStats && scoring) {
       proj = {};
