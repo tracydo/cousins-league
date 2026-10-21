@@ -320,14 +320,24 @@ function fromSnapshot() {
   return { weeks, at: L.snapshotAt };
 }
 
-async function getJSON(url) {
+async function fetchJSON(url, ms) {
   const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(), 7000);
+  const t = setTimeout(() => ctrl.abort(), ms);
   try {
     const r = await fetch(url, { cache: "no-store", signal: ctrl.signal });
     if (!r.ok) throw new Error(r.status);
     return await r.json();
   } finally { clearTimeout(t); }
+}
+// On the hosted site, data goes through our own /api/proxy (server-side), so it
+// doesn't depend on the visitor's browser reaching Sleeper/ESPN directly.
+let useRelay = /^https?:$/.test(location.protocol) && !/claude\.ai|claudeusercontent/.test(location.hostname);
+async function getJSON(url) {
+  if (useRelay) {
+    try { return await fetchJSON("/api/proxy?u=" + encodeURIComponent(url), 10000); }
+    catch (e) { if (String(e && e.message) === "404") useRelay = false; else throw e; }
+  }
+  return fetchJSON(url, 10000);
 }
 
 async function fromSleeper() {
@@ -337,14 +347,19 @@ async function fromSleeper() {
     getJSON(`${api}/league/${L.leagueId}`).catch(() => null)
   ]);
   const scoring = league && league.scoring_settings;
-  const byUser = {};
-  users.forEach(u => {
-    const key = (u.display_name || u.username || "").toLowerCase();
-    byUser[u.user_id] = key;
-    if (u.metadata && u.metadata.team_name) teamNames[key] = u.metadata.team_name;
+  // Match people by roster number (permanent). Display names can be changed in Sleeper
+  // at any time, which used to drop that person's games from the standings.
+  const rmap = {}, keyByUser = {};
+  rosters.forEach(r => {
+    const key = SNAP.rosters[r.roster_id];
+    if (!key) return;
+    rmap[r.roster_id] = key;
+    if (r.owner_id) keyByUser[r.owner_id] = key;
   });
-  const rmap = {};
-  rosters.forEach(r => { if (byUser[r.owner_id]) rmap[r.roster_id] = byUser[r.owner_id]; });
+  users.forEach(u => {
+    const key = keyByUser[u.user_id];
+    if (key && u.metadata && u.metadata.team_name) teamNames[key] = u.metadata.team_name;
+  });
   const cur = Math.max(1, Number(nfl.display_week || nfl.week) || 1);
   const upto = Math.min(cur, L.regWeeks);
   const weeks = [];
@@ -432,7 +447,7 @@ async function fromSleeper() {
   weeks.forEach(w => w.lineups && Object.values(w.lineups).forEach(lu => Object.keys(lu.p).forEach(id => { if (!PLAYERS[id] && !isTeamDef(id)) missing.add(id); })));
   if (missing.size && !playersLoaded) {
     try {
-      const all = await getJSON(`${api}/players/nfl`);
+      const all = await fetchJSON(`${api}/players/nfl`, 20000); // too big for the relay; fetched once per visit
       missing.forEach(id => { const x = all[id]; if (x) PLAYERS[id] = [x.full_name || `${x.first_name} ${x.last_name}`, (x.fantasy_positions && x.fantasy_positions[0]) || x.position]; });
       playersLoaded = true;
     } catch {}
@@ -541,8 +556,13 @@ function storylines(weeks) {
 function renderTop() {
   const d = state.data;
   const up = document.getElementById("updated");
+  if (!d) {
+    up.innerHTML = `<span>${state.failed ? "Couldn't reach Sleeper. Retrying…" : "Loading live scores…"}</span>`;
+    document.getElementById("view").innerHTML = `<p class="lede" style="text-align:center;padding:48px 0">${state.failed ? "Sleeper isn't responding right now. This page will keep trying." : "Pulling live scores from Sleeper…"}</p>`;
+    return;
+  }
   if (state.source === "live") {
-    up.innerHTML = `<span>Live from Sleeper, updated <time datetime="${d.at}">${esc(when(d.at))}</time></span>
+    up.innerHTML = `<span>${state.failed ? "⚠️ Sleeper not responding, retrying. " : ""}Live from Sleeper, updated <time datetime="${d.at}">${esc(when(d.at))}</time></span>
       <button class="btn" id="refresh" type="button" ${state.loading ? "disabled" : ""}>${state.loading ? "Refreshing…" : "Refresh"}</button>`;
     document.getElementById("refresh").onclick = load;
   } else {
@@ -882,12 +902,12 @@ async function load() {
   state.loading = true; if (state.data) renderTop();
   try {
     state.data = await fromSleeper();
-    state.source = "live";
+    state.source = "live"; state.failed = false;
   } catch {
-    if (state.source !== "live") { state.data = fromSnapshot(); state.source = "saved"; }
+    state.failed = true;
   }
   state.loading = false;
-  pickWeek(); render();
+  if (state.data) { pickWeek(); render(); } else renderTop();
 }
 
 document.querySelectorAll(".tab").forEach(b => b.onclick = () => { state.tab = b.dataset.tab; render(); });
@@ -906,9 +926,13 @@ themeBtn.onclick = () => {
   store.set("cousins-theme", next); applyTheme(next);
 };
 
-state.data = fromSnapshot(); pickWeek(); render();
+renderTop();
 load();
-setInterval(() => { if (state.source === "live" && !document.hidden) load(); }, 90000);
+// Keep pulling: every 60s while the page is visible (every 20s while Sleeper is unreachable),
+// and immediately when someone comes back to the tab.
+setInterval(() => { if (!document.hidden && !state.loading && !state.failed) load(); }, 60000);
+setInterval(() => { if (!document.hidden && !state.loading && state.failed) load(); }, 20000);
+document.addEventListener("visibilitychange", () => { if (!document.hidden && !state.loading) load(); });
 </script>
 </body>
 </html>
